@@ -1,26 +1,46 @@
-pub struct MapArea {
-    vpn_range: VPNRange,
-    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
-    map_type: MapType,
-    map_perm: MapPermission,
+use core::arch::asm;
+use super::{PageTable, PageTableEntry, PTEFlags};
+use super::{VirtPageNum, VirtAddr, PhysPageNum, PhysAddr};
+use super::{FrameTracker, frame_alloc};
+use super::{VPNRange, StepByOne};
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use riscv::register::satp;
+use alloc::sync::Arc;
+use lazy_static::*;
+use crate::sync::UPSafeCell;
+use crate::config::{
+    MEMORY_END,
+    PAGE_SIZE,
+    TRAMPOLINE,
+    TRAP_CONTEXT,
+    USER_STACK_SIZE
+};
+
+extern "C" {
+    fn stext();
+    fn etext();
+    fn srodata();
+    fn erodata();
+    fn sdata();
+    fn edata();
+    fn sbss_with_stack();
+    fn ebss();
+    fn ekernel();
+    fn strampoline();
 }
-#[derive(Copy, Clone, PartialEq, Debug)]
-pub enum MapType {
-    Identical,
-    Framed,
+
+lazy_static! {
+    pub static ref KERNEL_SPACE: Arc<UPSafeCell<MemorySet>> = Arc::new(unsafe {
+        UPSafeCell::new(MemorySet::new_kernel())
+    });
 }
-bitflags! {
-    pub struct MapPermission: u8 {
-        const R = 1 << 1;
-        const W = 1 << 2;
-        const X = 1 << 3;
-        const U = 1 << 4;
-    }
-}
+
 pub struct MemorySet {
     page_table: PageTable,
     areas: Vec<MapArea>,
 }
+
 impl MemorySet {
     pub fn new_bare() -> Self {
         Self {
@@ -40,6 +60,15 @@ impl MemorySet {
             permission,
         ), None);
     }
+
+    pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
+        if let Some((idx, area)) = self.areas.iter_mut().enumerate()
+            .find(|(_, area)| area.vpn_range.get_start() == start_vpn) {
+            area.unmap(&mut self.page_table);
+            self.areas.remove(idx);
+        }
+    }
+
     fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
         map_area.map(&mut self.page_table);
         if let Some(data) = data {
@@ -55,16 +84,7 @@ impl MemorySet {
             PTEFlags::R | PTEFlags::X,
         );
     }
-    pub fn activate(&self) {
-        let satp = self.page_table.token();
-        unsafe {
-            satp::write(satp);
-            asm!("sfence.vma");
-        }
-    }
-    pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
-        self.page_table.translate(vpn)
-    }
+    /// Without kernel stacks.
     pub fn new_kernel() -> Self {
         let mut memory_set = Self::new_bare();
         // map trampoline
@@ -111,7 +131,7 @@ impl MemorySet {
         ), None);
         memory_set
     }
-     /// Include sections in elf and trampoline and TrapContext and user stack,
+    /// Include sections in elf and trampoline and TrapContext and user stack,
     /// also returns user_sp and entry point.
     pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
         let mut memory_set = Self::new_bare();
@@ -169,6 +189,46 @@ impl MemorySet {
         (memory_set, user_stack_top, elf.header.pt2.entry_point() as usize)
     }
 
+    pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
+        let mut memory_set = Self::new_bare();
+        // map trampoline
+        memory_set.map_trampoline();
+        // copy data sections/trap_context/user_stack
+        for area in user_space.areas.iter() {
+            let new_area = MapArea::from_another(area);
+            memory_set.push(new_area, None);
+            // copy data from another space
+            for vpn in area.vpn_range {
+                let src_ppn = user_space.translate(vpn).unwrap().ppn();
+                let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
+                dst_ppn.get_bytes_array().copy_from_slice(src_ppn.get_bytes_array());
+            }
+        }
+        memory_set
+    }
+
+    pub fn activate(&self) {
+        let satp = self.page_table.token();
+        unsafe {
+            satp::write(satp);
+            asm!("sfence.vma");
+        }
+    }
+    pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
+        self.page_table.translate(vpn)
+    }
+
+    pub fn recycle_data_pages(&mut self) {
+        //*self = Self::new_bare();
+        self.areas.clear();
+    }
+}
+
+pub struct MapArea {
+    vpn_range: VPNRange,
+    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    map_type: MapType,
+    map_perm: MapPermission,
 }
 
 impl MapArea {
@@ -187,6 +247,16 @@ impl MapArea {
             map_perm,
         }
     }
+
+    pub fn from_another(another: &MapArea) -> Self {
+        Self {
+            vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
+            data_frames: BTreeMap::new(),
+            map_type: another.map_type,
+            map_perm: another.map_perm,
+        }
+    }
+
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
         match self.map_type {
@@ -202,7 +272,7 @@ impl MapArea {
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
         page_table.map(vpn, ppn, pte_flags);
     }
-    #[allow(unused)]
+    
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         match self.map_type {
             MapType::Framed => {
@@ -217,7 +287,7 @@ impl MapArea {
             self.map_one(page_table, vpn);
         }
     }
-    #[allow(unused)]
+    
     pub fn unmap(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
             self.unmap_one(page_table, vpn);
@@ -247,43 +317,21 @@ impl MapArea {
     }
 }
 
-
-extern "C" {
-    fn stext();
-    fn etext();
-    fn srodata();
-    fn erodata();
-    fn sdata();
-    fn edata();
-    fn sbss_with_stack();
-    fn ebss();
-    fn ekernel();
-    fn strampoline();
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum MapType {
+    Identical,
+    Framed,
 }
 
-use core::arch::asm;
-use super::{PageTable, PageTableEntry, PTEFlags};
-use super::{VirtPageNum, VirtAddr, PhysPageNum, PhysAddr};
-use super::{FrameTracker, frame_alloc};
-use super::{VPNRange, StepByOne};
-use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
-use riscv::register::satp;
-use alloc::sync::Arc;
-use lazy_static::*;
-use crate::sync::UPSafeCell;
-use crate::config::{
-    MEMORY_END,
-    PAGE_SIZE,
-    TRAMPOLINE,
-    TRAP_CONTEXT,
-    USER_STACK_SIZE
-};
-lazy_static! {
-    pub static ref KERNEL_SPACE: Arc<UPSafeCell<MemorySet>> = Arc::new(unsafe {
-        UPSafeCell::new(MemorySet::new_kernel()
-    )});
+bitflags! {
+    pub struct MapPermission: u8 {
+        const R = 1 << 1;
+        const W = 1 << 2;
+        const X = 1 << 3;
+        const U = 1 << 4;
+    }
 }
+
 #[allow(unused)]
 pub fn remap_test() {
     let mut kernel_space = KERNEL_SPACE.exclusive_access();
